@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -15,19 +16,9 @@ import (
 	"github.com/javgh/sia-bootstrap/httpreaderat"
 )
 
-func debug(options client.Options) error {
-	httpClient := client.New(options)
-
-	consensusStatus, err := httpClient.ConsensusGet()
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(consensusStatus)
-	fmt.Println(consensusStatus.Synced)
-
-	return nil
-}
+const (
+	retryInterval = 5 * time.Second
+)
 
 func readConfig() error {
 	userConfigDir, err := os.UserConfigDir()
@@ -105,7 +96,8 @@ func runPre(cmd *cobra.Command, args []string) {
 		log.Fatal(err)
 	}
 
-	consensusFile, err := os.Create(consensusLocation)
+	temporaryConsensusLocation := fmt.Sprintf("%s.incomplete", consensusLocation)
+	consensusFile, err := os.Create(temporaryConsensusLocation)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -123,6 +115,142 @@ func runPre(cmd *cobra.Command, args []string) {
 	err = rc.Close()
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	err = os.Rename(temporaryConsensusLocation, consensusLocation)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runPost(options client.Options) {
+	err := readConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("Waiting for Sia daemon to become available... ")
+	httpClient := client.New(options)
+	for {
+		_, err = httpClient.ConsensusGet()
+		if err == nil {
+			break
+		}
+		time.Sleep(retryInterval)
+	}
+
+	fmt.Println("Waiting for Sia daemon to sync... ")
+	for {
+		consensusStatus, err := httpClient.ConsensusGet()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if consensusStatus.Synced {
+			break
+		}
+		time.Sleep(retryInterval)
+	}
+
+	if !viper.GetBool("ensure_wallet_initialized") {
+		return
+	}
+
+	walletStatus, err := httpClient.WalletGet()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Sia wallets are always encrypted. If it is reported as
+	// unencrypted, it means that the wallet has not been initialized yet.
+	if !walletStatus.Encrypted {
+		if !viper.IsSet("wallet_password") {
+			log.Fatal("Please set wallet_password to initialize wallet.")
+		}
+		walletPassword := viper.GetString("wallet_password")
+
+		if viper.IsSet("wallet_seed") {
+			fmt.Println("Initializing wallet with provided seed...")
+			walletSeed := viper.GetString("wallet_seed")
+			err = httpClient.WalletInitSeedPost(walletSeed, walletPassword, false)
+			if err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			fmt.Println("Initializing wallet with fresh seed...")
+			_, err = httpClient.WalletInitPost(walletPassword, false)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
+
+	if !viper.GetBool("ensure_wallet_unlocked") {
+		return
+	}
+	walletStatus, err = httpClient.WalletGet()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if !walletStatus.Unlocked {
+		if !viper.IsSet("wallet_password") {
+			log.Fatal("Please set wallet_password to unlock wallet.")
+		}
+		walletPassword := viper.GetString("wallet_password")
+
+		fmt.Println("Unlocking wallet...")
+		err = httpClient.WalletUnlockPost(walletPassword)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	if !viper.GetBool("ensure_recovery") {
+		return
+	}
+
+	// Only go through the recovery process if
+	// we don't already have (found) some contracts.
+	rc, err := httpClient.RenterAllContractsGet()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	contractCount := len(rc.ActiveContracts) + len(rc.PassiveContracts) +
+		len(rc.RefreshedContracts) + len(rc.DisabledContracts) + len(rc.ExpiredContracts) +
+		len(rc.ExpiredRefreshedContracts) + len(rc.RecoverableContracts)
+	if contractCount == 0 {
+		fmt.Println("Triggering recovery scan...")
+		err = httpClient.RenterInitContractRecoveryScanPost()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// Wait for recovery scan to start.
+		for {
+			recoveryStatus, err := httpClient.RenterContractRecoveryProgressGet()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			if recoveryStatus.ScanInProgress {
+				break
+			}
+			time.Sleep(retryInterval)
+		}
+
+		// Wait for recovery scan to complete.
+		for {
+			recoveryStatus, err := httpClient.RenterContractRecoveryProgressGet()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			if !recoveryStatus.ScanInProgress {
+				break
+			}
+			time.Sleep(retryInterval)
+		}
 	}
 }
 
@@ -159,10 +287,7 @@ func main() {
 			options.Address = siaDaemonAddress
 			options.Password = siaDaemonPassword
 
-			err := debug(options)
-			if err != nil {
-				log.Fatal(err)
-			}
+			runPost(options)
 		},
 	}
 
