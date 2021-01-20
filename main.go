@@ -17,7 +17,8 @@ import (
 )
 
 const (
-	retryInterval = 5 * time.Second
+	retryInterval  = 5 * time.Second
+	daemonReadyMsg = "Sia daemon is ready"
 )
 
 func readConfig() error {
@@ -152,6 +153,7 @@ func runPost(options client.Options) {
 	}
 
 	if !viper.GetBool("ensure_wallet_initialized") {
+		fmt.Println(daemonReadyMsg)
 		return
 	}
 
@@ -185,6 +187,7 @@ func runPost(options client.Options) {
 	}
 
 	if !viper.GetBool("ensure_wallet_unlocked") {
+		fmt.Println(daemonReadyMsg)
 		return
 	}
 	walletStatus, err = httpClient.WalletGet()
@@ -206,6 +209,7 @@ func runPost(options client.Options) {
 	}
 
 	if !viper.GetBool("ensure_recovery") {
+		fmt.Println(daemonReadyMsg)
 		return
 	}
 
@@ -252,6 +256,8 @@ func runPost(options client.Options) {
 			time.Sleep(retryInterval)
 		}
 	}
+
+	fmt.Println(daemonReadyMsg)
 }
 
 func main() {
